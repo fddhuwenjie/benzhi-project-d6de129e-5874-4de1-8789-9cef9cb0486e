@@ -487,6 +487,31 @@ type AuditPage struct {
 	TypeCounts map[string]int      `json:"type_counts,omitempty"`
 }
 
+// cloneAuditPage returns a deep copy of p so the returned slice, each event
+// (including PayloadJSON) and the TypeCounts map are fully isolated from the
+// cached copy and from prior return values. This prevents cross-call state
+// pollution when a caller mutates the returned page while the cache keeps a
+// reusable copy.
+func cloneAuditPage(p AuditPage) AuditPage {
+	out := p
+	if p.Events != nil {
+		out.Events = make([]domain.AuditEvent, len(p.Events))
+		for i := range p.Events {
+			out.Events[i] = p.Events[i]
+			if p.Events[i].PayloadJSON != nil {
+				out.Events[i].PayloadJSON = append([]byte(nil), p.Events[i].PayloadJSON...)
+			}
+		}
+	}
+	if p.TypeCounts != nil {
+		out.TypeCounts = make(map[string]int, len(p.TypeCounts))
+		for k, v := range p.TypeCounts {
+			out.TypeCounts[k] = v
+		}
+	}
+	return out
+}
+
 type AuditFilter struct {
 	ActorID, EventType       string
 	MinRevision, MaxRevision uint64
@@ -664,7 +689,7 @@ func (a *App) AuditWithCursor(id, cursor string, limit int) (AuditPage, error) {
 	}{id, cursor, lastDigest(events), limit})
 	a.auditPageMu.Lock()
 	if a.auditPageValid && a.auditPageKey == cacheKey {
-		cached := a.auditPageCache
+		cached := cloneAuditPage(a.auditPageCache)
 		a.auditPageMu.Unlock()
 		return cached, nil
 	}
@@ -697,10 +722,10 @@ func (a *App) AuditWithCursor(id, cursor string, limit int) (AuditPage, error) {
 	}
 	a.auditPageMu.Lock()
 	a.auditPageKey = cacheKey
-	a.auditPageCache = page
+	a.auditPageCache = cloneAuditPage(page)
 	a.auditPageValid = true
 	a.auditPageMu.Unlock()
-	return page, nil
+	return cloneAuditPage(page), nil
 }
 func (a *App) Manifest(id string) ([]byte, string, error) {
 	c, e := a.Store.Get(id)
