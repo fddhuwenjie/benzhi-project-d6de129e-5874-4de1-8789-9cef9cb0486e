@@ -222,6 +222,15 @@ func (s *Store) Commit(c *domain.ProvenanceCase, expected uint64, req, fp string
 	payloadJSON, _ := json.Marshal(payload)
 	e := domain.AuditEvent{EventID: fmt.Sprintf("%s-%d", c.ID, c.Revision), CaseID: c.ID, Revision: c.Revision, EventType: typ, ActorID: actor, RequestID: req, OccurredAt: now, PayloadJSON: payloadJSON, PreviousDigest: prev}
 	e.Digest = archive.EventDigest(e)
+	// Capture the pre-mutation state so we can roll back in-memory state if
+	// persistence fails. This keeps process-visible state consistent with the
+	// last successfully persisted snapshot.
+	var prevCase *domain.ProvenanceCase
+	if old != nil {
+		prevCase = cloneCase(old)
+	}
+	prevEvents := append([]domain.AuditEvent(nil), s.events[c.ID]...)
+	_, prevIdem := s.idem[req]
 	s.cases[c.ID] = cloneCase(c)
 	s.events[c.ID] = append(s.events[c.ID], e)
 	resp, _ := json.Marshal(c)
@@ -229,6 +238,20 @@ func (s *Store) Commit(c *domain.ProvenanceCase, expected uint64, req, fp string
 		s.idem[req] = Idempotent{Fingerprint: fp, Response: resp}
 	}
 	if err := s.persist(); err != nil {
+		// Roll back in-memory state so it matches the last persisted snapshot.
+		if prevCase != nil {
+			s.cases[c.ID] = prevCase
+		} else if !exists {
+			delete(s.cases, c.ID)
+		}
+		if len(prevEvents) > 0 {
+			s.events[c.ID] = prevEvents
+		} else {
+			delete(s.events, c.ID)
+		}
+		if !prevIdem {
+			delete(s.idem, req)
+		}
 		s.healthy = false
 		s.loadErr = fmt.Errorf("storage_unhealthy: %w", err)
 		return nil, s.loadErr
@@ -270,6 +293,7 @@ func (s *Store) Create(c *domain.ProvenanceCase, req, fp, actor string) ([]byte,
 	e := domain.AuditEvent{EventID: fmt.Sprintf("%s-1", c.ID), CaseID: c.ID, Revision: 1, EventType: "CASE_CREATED", ActorID: actor, RequestID: req, OccurredAt: time.Now().UTC(), PayloadJSON: payloadJSON, PreviousDigest: prev}
 	e.Digest = archive.EventDigest(e)
 	c.Revision = 1
+	_, prevIdem := s.idem[req]
 	s.cases[c.ID] = cloneCase(c)
 	s.events[c.ID] = []domain.AuditEvent{e}
 	resp, _ := json.Marshal(c)
@@ -277,6 +301,12 @@ func (s *Store) Create(c *domain.ProvenanceCase, req, fp, actor string) ([]byte,
 		s.idem[req] = Idempotent{Fingerprint: fp, Response: resp}
 	}
 	if err := s.persist(); err != nil {
+		// Roll back in-memory state so it matches the last persisted snapshot.
+		delete(s.cases, c.ID)
+		delete(s.events, c.ID)
+		if !prevIdem {
+			delete(s.idem, req)
+		}
 		s.healthy = false
 		s.loadErr = fmt.Errorf("storage_unhealthy: %w", err)
 		return nil, s.loadErr
