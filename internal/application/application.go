@@ -12,15 +12,12 @@ import (
 	"fossil-provenance-ledger/internal/domain"
 	"fossil-provenance-ledger/internal/store"
 	"sort"
-	"sync"
 	"time"
 )
 
 type App struct {
 	Store     *store.Store
 	cursorKey [32]byte
-	batchCacheMu sync.RWMutex
-	batchCache   map[string]BatchSnapshot
 }
 
 type CaseListFilter struct { Status domain.CaseStatus; FieldLead, CurrentCustodian string; From, To *time.Time }
@@ -35,7 +32,7 @@ func (a *App) ListCases(f CaseListFilter, cursor string, size int) (CaseListPage
 func caseListKey(c *domain.ProvenanceCase) string { t:=""; if c.CreatedAt!=nil {t=c.CreatedAt.UTC().Format(time.RFC3339Nano)}; return t+"|"+c.ID }
 func caseFilterKey(f CaseListFilter) string { return fp(struct{Status domain.CaseStatus; FieldLead,CurrentCustodian string; From,To *time.Time}{f.Status,f.FieldLead,f.CurrentCustodian,f.From,f.To}) }
 
-func New(s *store.Store) *App { a := &App{Store: s, batchCache: make(map[string]BatchSnapshot)}; _, _ = rand.Read(a.cursorKey[:]); return a }
+func New(s *store.Store) *App { a := &App{Store: s}; _, _ = rand.Read(a.cursorKey[:]); return a }
 func fp(v any) string {
 	b, _ := json.Marshal(v)
 	h := sha256.Sum256(b)
@@ -216,18 +213,11 @@ func cloneBatchSnapshot(x BatchSnapshot) BatchSnapshot {
 	x.RetiredSeals = append([]string(nil), x.RetiredSeals...)
 	return x
 }
-func (a *App) BatchSnapshot(id, batch string) (BatchSnapshot, error) {
-	key := id + "\x00" + batch
-	a.batchCacheMu.RLock()
-	cached, ok := a.batchCache[key]
-	a.batchCacheMu.RUnlock()
-	if ok {
-		return cloneBatchSnapshot(cached), nil
-	}
-	c, e := a.Store.Get(id)
-	if e != nil {
-		return BatchSnapshot{}, e
-	}
+
+// computeBatchSnapshot derives a batch snapshot directly from a case without
+// touching the store or any cache. Callers receive a value whose slice fields
+// are already defensive copies, so they can safely inspect or return it.
+func computeBatchSnapshot(c *domain.ProvenanceCase, batch string) BatchSnapshot {
 	ss := []string{}
 	n := uint32(0)
 	for _, s := range c.Specimens {
@@ -243,12 +233,39 @@ func (a *App) BatchSnapshot(id, batch string) (BatchSnapshot, error) {
 	if c.Status == domain.ExtractionAuthorized {
 		pending = n
 	}
-	x := BatchSnapshot{CaseID: id, Revision: c.Revision, ExtractionBatch: batch, RegisteredCount: n, PendingCount: pending, Seals: ss, RetiredSeals: append([]string(nil), c.RetiredSeals...), CanTransfer: c.Status == domain.Extracted || c.Status == domain.InTransit}
+	x := BatchSnapshot{CaseID: c.ID, Revision: c.Revision, ExtractionBatch: batch, RegisteredCount: n, PendingCount: pending, Seals: ss, RetiredSeals: append([]string(nil), c.RetiredSeals...), CanTransfer: c.Status == domain.Extracted || c.Status == domain.InTransit}
 	x.Digest = fp(x)
-	a.batchCacheMu.Lock()
-	a.batchCache[key] = cloneBatchSnapshot(x)
-	a.batchCacheMu.Unlock()
-	return x, nil
+	return x
+}
+
+// snapshotDigestMatches reports whether digest equals the digest of any
+// batch snapshot (including the whole-case snapshot) derivable from c.
+func snapshotDigestMatches(c *domain.ProvenanceCase, digest string) bool {
+	if digest == "" {
+		return true
+	}
+	if computeBatchSnapshot(c, "").Digest == digest {
+		return true
+	}
+	seen := map[string]bool{}
+	for _, s := range c.Specimens {
+		if seen[s.ExtractionBatch] {
+			continue
+		}
+		seen[s.ExtractionBatch] = true
+		if computeBatchSnapshot(c, s.ExtractionBatch).Digest == digest {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *App) BatchSnapshot(id, batch string) (BatchSnapshot, error) {
+	c, e := a.Store.Get(id)
+	if e != nil {
+		return BatchSnapshot{}, e
+	}
+	return cloneBatchSnapshot(computeBatchSnapshot(c, batch)), nil
 }
 
 type TransferView struct { Transfers []domain.CustodyTransfer `json:"transfers"`; CurrentCustodian string `json:"current_custodian,omitempty"`; NextReceiver string `json:"next_receiver,omitempty"`; OpenDiscrepancies []string `json:"open_discrepancies,omitempty"`; TotalCount int `json:"total_count"` }
@@ -326,11 +343,15 @@ func (a *App) ReplaceSeal(id string, expected uint64, req, actor, field, oldCode
 
 func (a *App) Transfer(id string, expected uint64, req, actor string, t domain.CustodyTransfer) (*domain.ProvenanceCase, error) {
 	t.CaseID = id
-	if t.SnapshotDigest != "" { snap,e:=a.BatchSnapshot(id,""); if e!=nil{return nil,e}; match:=snap.Digest==t.SnapshotDigest; if !match { if cc,e2:=a.Store.Get(id);e2==nil { seen:=map[string]bool{}; for _,sp:=range cc.Specimens { if seen[sp.ExtractionBatch]{continue}; seen[sp.ExtractionBatch]=true; if x,_:=a.BatchSnapshot(id,sp.ExtractionBatch); x.Digest==t.SnapshotDigest {match=true;break} } } }; if !match{return nil,domain.ErrSnapshotConflict} }
 	if t.ID == "" {
 		t.ID = fmt.Sprintf("%s-transfer-%d", id, expected+1)
 	}
-	return a.mutate(id, expected, req, actor, "CUSTODY_TRANSFER", &t, func(c *domain.ProvenanceCase) error { return domain.ValidateTransfer(c, &t, actor, time.Now().UTC()) })
+	return a.mutate(id, expected, req, actor, "CUSTODY_TRANSFER", &t, func(c *domain.ProvenanceCase) error {
+		if t.SnapshotDigest != "" && !snapshotDigestMatches(c, t.SnapshotDigest) {
+			return domain.ErrSnapshotConflict
+		}
+		return domain.ValidateTransfer(c, &t, actor, time.Now().UTC())
+	})
 }
 func (a *App) ResolveCustodyItems(id string, expected uint64, req, actor string, resolutions []domain.DiscrepancyResolution, itemIDs []string) (*domain.ProvenanceCase, []string, error) {
 	byID := map[string]domain.DiscrepancyResolution{}
